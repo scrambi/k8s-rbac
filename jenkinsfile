@@ -1,0 +1,104 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  environment {
+    NS           = 'gitlab-admin'
+    SA_NAME      = 'gitlab-ci-admin'
+    KCFG_OUT     = 'kubeconfig-gitlab-ci-admin'   // имя генерируемого файла
+    TG_CHAT_ID   = '180424264'                    // твой chat_id
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Apply RBAC') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+          sh '''
+            set -e
+            kubectl apply -f rbac/00-namespace.yaml
+            kubectl apply -f rbac/10-sa.yaml
+            kubectl apply -f rbac/20-crb.yaml
+          '''
+        }
+      }
+    }
+
+    stage('Issue token & build kubeconfig for SA') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+          sh '''
+            set -e
+            # не подсвечивать токен в логах
+            set +x
+
+            # адрес API и CA
+            SERVER="$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')"
+            CA_B64="$(kubectl get -n kube-system configmap extension-apiserver-authentication \
+              -o jsonpath='{.data.client-ca-file}' | xargs cat | base64 -w0)"
+
+            # долгоживущий токен (1 год). Для старых кластеров можно создать secret типа kubernetes.io/service-account-token
+            TOKEN="$(kubectl -n ${NS} create token ${SA_NAME} --duration=88760h)"
+
+            cat > ${KCFG_OUT} <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CA_B64}
+    server: ${SERVER}
+  name: k8s
+contexts:
+- context:
+    cluster: k8s
+    namespace: ${NS}
+    user: ${SA_NAME}
+  name: ${SA_NAME}@k8s
+current-context: ${SA_NAME}@k8s
+users:
+- name: ${SA_NAME}
+  user:
+    token: ${TOKEN}
+EOF
+          '''
+        }
+      }
+    }
+
+    stage('Publish kubeconfig as build artifact') {
+      steps {
+        archiveArtifacts artifacts: 'kubeconfig-gitlab-ci-admin', fingerprint: true
+      }
+    }
+  }
+
+  post {
+    success {
+      withCredentials([string(credentialsId: 'telegram-bot-token', variable: 'TG')]) {
+        sh '''
+          curl -s -X POST -H 'Content-Type: application/json' \
+            --data-binary @- https://api.telegram.org/bot'"${TG}"'/sendMessage <<EOF
+{"chat_id":"'"${TG_CHAT_ID}"'","text":"✅ SA *gitlab-ci-admin* создан и kubeconfig сгенерирован (build #'\"${BUILD_NUMBER}\"').","parse_mode":"Markdown"}
+EOF
+        '''
+      }
+    }
+    failure {
+      withCredentials([string(credentialsId: 'telegram-bot-token', variable: 'TG')]) {
+        sh '''
+          curl -s -X POST -H 'Content-Type: application/json' \
+            --data-binary @- https://api.telegram.org/bot'"${TG}"'/sendMessage <<EOF
+{"chat_id":"'"${TG_CHAT_ID}"'","text":"❌ Ошибка при создании SA для GitLab (build #'\"${BUILD_NUMBER}\"'). Проверь логи Jenkins."}
+EOF
+        ''' || true
+      }
+    }
+  }
+}
