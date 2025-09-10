@@ -7,25 +7,23 @@ pipeline {
   }
 
   environment {
-    NS         = 'gitlab-admin'           // namespace для SA
-    SA_NAME    = 'gitlab-ci-admin'        // имя сервис-аккаунта
-    KCFG_OUT   = 'kubeconfig-gitlab-ci-admin' // имя генерируемого kubeconfig
-    TG_CHAT_ID = '180424264'              // <<-- твой chat_id
+    NS         = 'gitlab-admin'                // namespace для SA
+    SA_NAME    = 'gitlab-ci-admin'             // имя сервис-аккаунта
+    KCFG_OUT   = 'kubeconfig-gitlab-ci-admin'  // имя генерируемого kubeconfig
+    TG_CHAT_ID = '180424264'                   // твой chat_id
   }
 
   stages {
 
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Apply RBAC') {
       steps {
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
           sh '''
-            set -e
+            set -euo pipefail
             kubectl apply -f rbac/00-namespace.yaml
             kubectl apply -f rbac/10-sa.yaml
             kubectl apply -f rbac/20-crb.yaml
@@ -38,11 +36,11 @@ pipeline {
       steps {
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
           sh '''
-            set -e
+            set -euo pipefail
             # не светим секреты в логе
             set +x
 
-            # URL API сервера и CA (берём прямо из kubeconfig; уже base64)
+            # URL API сервера и CA (берём из kubeconfig; CA уже base64)
             SERVER="$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}')"
             CA_B64="$(kubectl config view  --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
 
@@ -60,10 +58,15 @@ metadata:
     kubernetes.io/service-account.name: "${SA_NAME}"
 type: kubernetes.io/service-account-token
 EOF
-              TOKEN="$(kubectl -n ${NS} get secret ${SA_NAME}-token -o jsonpath='{.data.token}' | base64 -d)"
+              # подождём, пока контроллер наполнит secret
+              for i in {1..10}; do
+                TOKEN="$(kubectl -n ${NS} get secret ${SA_NAME}-token -o jsonpath='{.data.token}' 2>/dev/null || true)"
+                [ -n "$TOKEN" ] && { TOKEN="$(echo "$TOKEN" | base64 -d)"; break; }
+                sleep 1
+              done
             fi
 
-            cat > ${KCFG_OUT} <<EOF
+            cat > "${KCFG_OUT}" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
@@ -90,7 +93,7 @@ EOF
 
     stage('Publish kubeconfig') {
       steps {
-        archiveArtifacts artifacts: 'kubeconfig-gitlab-ci-admin', fingerprint: true
+        archiveArtifacts artifacts: "${KCFG_OUT}", fingerprint: true
       }
     }
   }
@@ -99,21 +102,28 @@ EOF
     success {
       withCredentials([string(credentialsId: 'telegram-bot-token', variable: 'TG')]) {
         sh '''
-          curl -s -X POST -H 'Content-Type: application/json' \
-            --data-binary @- https://api.telegram.org/bot'"${TG}"'/sendMessage <<EOF
-{"chat_id":"'"${TG_CHAT_ID}"'","text":"✅ SA *gitlab-ci-admin* создан, kubeconfig сгенерирован (job: '"${JOB_NAME}"' #'"${BUILD_NUMBER}"').","parse_mode":"Markdown"}
-EOF
+          set +x
+          TG_CLEAN=$(printf %s "$TG" | tr -d '\\r\\n')
+          # sanity-check (не роняем билд)
+          curl -fsS "https://api.telegram.org/bot$TG_CLEAN/getMe" -o /dev/null || true
+          # notify
+          curl -fsS -X POST "https://api.telegram.org/bot$TG_CLEAN/sendMessage" \
+            -d "chat_id='${TG_CHAT_ID}'" \
+            --data-urlencode "text=✅ SA создан/обновлён: ${JOB_NAME} #${BUILD_NUMBER}" \
+            -o /dev/null || true
         '''
       }
     }
     failure {
       withCredentials([string(credentialsId: 'telegram-bot-token', variable: 'TG')]) {
         sh '''
-          curl -s -X POST -H 'Content-Type: application/json' \
-            --data-binary @- https://api.telegram.org/bot'"${TG}"'/sendMessage <<EOF
-{"chat_id":"'"${TG_CHAT_ID}"'","text":"❌ Ошибка при создании SA для GitLab (job: '"${JOB_NAME}"' #'"${BUILD_NUMBER}"'). См. логи Jenkins."}
-EOF
-        ''' || true
+          set +x
+          TG_CLEAN=$(printf %s "$TG" | tr -d '\\r\\n')
+          curl -fsS -X POST "https://api.telegram.org/bot$TG_CLEAN/sendMessage" \
+            -d "chat_id='${TG_CHAT_ID}'" \
+            --data-urlencode "text=❌ Ошибка: ${JOB_NAME} #${BUILD_NUMBER}. Проверь логи Jenkins." \
+            -o /dev/null || true
+        '''
       }
     }
   }
